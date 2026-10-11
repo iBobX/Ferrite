@@ -4,6 +4,7 @@ import {TypeSystem as T} from './TypeSystem.js';
 import {Lexer} from './Lexer.js';
 import {Parser} from './Parser.js';
 import {MirLowerer} from './MirLowerer.js';
+import {MirOptimizer} from './MirOptimizer.js';
 import {MirVerifier} from './MirVerifier.js';
 import {OwnershipAnalyzer} from './OwnershipAnalyzer.js';
 import {MirVirtualMachine} from '../runtime/MirVirtualMachine.js';
@@ -22,33 +23,84 @@ export class ConstantEvaluator {
     this.analyzer = analyzer; this.index = analyzer.index;
     this.maxSteps = maxSteps; this.maxExpressionSteps = maxExpressionSteps; this.maxExpressions = maxExpressions; this.maxValues = maxValues;
     this.cache = new Map(); this.active = new Set(); this.reports = [];
-    this.running = new Set();
+    this.running = new Set(); this.references = new Map();
     this.steps = 0; this.evaluations = 0; this.hits = 0; this.sequence = 0;
+  }
+
+  /** Check unused concrete initializers without executing their own values.
+   * Rust still validates surviving concrete constant operands in their MIR.
+   * Type-only dependency MIR exists exclusively in an isolated analyzer. */
+  checkAssociatedDefinitions() {
+    if (![...this.index.functions.values()].some(fn => fn.associatedConstant && fn.body && !fn.generics.length)) return;
+    // Function items, closures, obligations and discriminants also own side tables;
+    // isolating just instances would leave dangling callable identities behind.
+    const a = new this.analyzer.constructor(this.analyzer.ast, {mode: 'library',
+      maxInstances: this.analyzer.maxInstances, constEvaluation: this.analyzer.constEvaluationOptions});
+    a.constants.checkingDefinition = true;
+    for (const fn of a.index.functions.values()) if (fn.associatedConstant && fn.body && !fn.generics.length)
+      a.instantiate(fn, [], [], fn);
+    for (const instance of a.instances.values()) if (instance.fn.isConst) a.constants.validate(instance);
+    const instances = [...a.instances.values()];
+    OwnershipAnalyzer.analyze({instances});
+    const verification = {allowDeferredDiscriminants: true, constantReferences: a.constants.references};
+    const mir = MirLowerer.lower({instances}, verification);
+    MirVerifier.verify(mir, verification);
+    const {functions} = MirOptimizer.optimize(mir, verification);
+    const roots = new Set(instances.filter(i => i.fn.associatedConstant && !i.fn.generics.length && !i.fn.defaultTrait).map(i => i.key));
+    let evaluator = null;
+    for (const fn of functions) if (roots.has(fn.instance)) for (const block of fn.blocks)
+      for (const instruction of block.instructions) if (instruction.op === 'constantReference') {
+        // Do not execute with the type-only analyzer's cached function bodies:
+        // callees there intentionally contain unresolved reference operands.
+        if (!evaluator) {
+          const maxSteps = this.maxSteps - this.steps - a.constants.steps;
+          const maxExpressions = this.maxExpressions - this.evaluations - a.constants.evaluations;
+          if (maxSteps <= 0 || maxExpressions <= 0)
+            throw new Diagnostic('F_CONST_BUDGET', 'Compilation-wide constant dependency budget exceeded', instruction.span);
+          evaluator = new this.analyzer.constructor(this.analyzer.ast, {mode: 'library',
+            maxInstances: this.analyzer.maxInstances,
+            constEvaluation: {...this.analyzer.constEvaluationOptions, maxSteps, maxExpressions}});
+        }
+        const reference = a.constants.references.get(instruction.key);
+        const declaration = evaluator.index.functions.get(reference.fn.name);
+        evaluator.constants.evaluate(declaration.body.tail, declaration.module, declaration.returnType, declaration,
+          instruction.key, instruction, declaration.owner, {declaration, explicit: reference.arguments});
+      }
+    // Definition dependencies share the compilation-wide budget, not a separate
+    // allowance per initializer (the isolated analyzer otherwise owns all state).
+    this.steps += a.constants.steps + (evaluator?.constants.steps ?? 0);
+    this.evaluations += a.constants.evaluations + (evaluator?.constants.evaluations ?? 0);
+    if (this.steps > this.maxSteps || this.evaluations > this.maxExpressions)
+      throw new Diagnostic('F_CONST_BUDGET', 'Compilation-wide constant evaluation budget exceeded');
   }
 
   constant(declaration, use = declaration) {
     return this.evaluate(declaration.value, declaration.module, declaration.type, declaration, `item:${declaration.name}`, use);
   }
 
-  expression(expression, module = '', expected = '_', use = expression) {
-    return this.evaluate(expression, module, expected, use, null, use);
+  expression(expression, module = '', expected = '_', use = expression, context = null) {
+    const fn = context?.instance.fn, arguments_ = context?.instance.substitution ?? new Map(Object.entries(context?.instance.typeArguments ?? {}));
+    return this.evaluate(expression, module, expected, use, null, use, fn?.owner, fn ?
+      {declaration: fn, explicit: fn.generics.map(g => arguments_.get(g.name))} : null);
   }
 
-  length(source, module = '', node = null, parameters = new Set()) {
+  length(source, module = '', node = null, parameters = new Set(), owner = null) {
     if (parameters.has(source)) return source;
     if (/^\d+$/.test(source)) {
       const value = BigInt(source);
       if (value > 0xffffffffn) throw new Diagnostic('E0080', 'Array length overflows the browser target usize (32 bits)', node?.span);
       return String(value);
     }
-    const key = `length:${module}:${source}`;
+    const declaration = node?.typeContext ?? node;
+    const scope = {generics: [], predicates: [], defaultTrait: declaration?.defaultTrait, implementedTrait: declaration?.implementedTrait};
+    const key = 'length:' + JSON.stringify([module, owner, scope.defaultTrait, scope.implementedTrait, source]);
     if (this.cache.has(key)) { this.hits++; return this.cache.get(key).expression.value; }
     const parser = new Parser(Lexer.tokenize(source, {file: node?.span?.file ?? '<array-length>'}));
     const expression = parser.expr(); parser.c.eat('EOF');
     // Type names are canonical strings. Reparsed length syntax is attributed to
     // the original declaration, never to invented offsets in a generated file.
     if (node?.span) this.reanchor(expression, node.span);
-    return this.evaluate(expression, module, 'usize', node ?? expression, key).expression.value;
+    return this.evaluate(expression, module, 'usize', node ?? expression, key, node ?? expression, owner, {declaration: scope, explicit: []}).expression.value;
   }
 
   reanchor(node, span) {
@@ -58,20 +110,23 @@ export class ConstantEvaluator {
     for (const [key, value] of Object.entries(node)) if (!['span', 'loc'].includes(key)) this.reanchor(value, span);
   }
 
-  evaluate(expression, module, expected, origin, key = null, use = origin, owner = null) {
+  evaluate(expression, module, expected, origin, key = null, use = origin, owner = null, specialization = null) {
     if (key && this.cache.has(key)) { this.hits++; return this.cache.get(key); }
     if (key && this.active.has(key)) throw new Diagnostic('E0391', 'Cycle in constant evaluation', use?.span, [{message: [...this.active, key].join(' → '), span: origin?.span}]);
     if (++this.evaluations > this.maxExpressions || this.active.size >= 128) throw new Diagnostic('F_CONST_BUDGET', 'Constant evaluation expression/dependency budget exceeded', origin?.span);
-    const name = `$const$${this.sequence++}`, rootKey = `${name}<>`;
-    const fn = {kind: 'fn', name, localName: name, module, isConst: true, constRoot: true, owner,
-      generics: [], predicates: [], params: [], returnType: expected, attributes: [], visibility: 'private',
+    const name = `$const$${this.sequence++}`; let rootKey = null;
+    const fn = {...specialization?.declaration, kind: 'fn', name, localName: name, module, isConst: true, constRoot: true, owner,
+      generics: specialization?.declaration.generics ?? [], predicates: specialization?.declaration.predicates ?? [],
+      params: [], returnType: expected, attributes: [], visibility: 'private',
       span: origin?.span ?? expression.span, id: `${expression.id}:const-root`,
       body: {kind: 'block', id: `${expression.id}:const-body`, span: expression.span, body: [], tail: structuredClone(expression)}};
-    const queryCache = this.analyzer.queryCache;
+    const queryCache = this.analyzer.queryCache, checkingDefinition = this.checkingDefinition;
+    this.checkingDefinition = false;
     if (key) this.active.add(key);
     this.analyzer.queryCache = null;
     try {
-      const instance = this.analyzer.instantiate(fn, [], [], origin ?? expression);
+      const instance = this.analyzer.instantiate(fn, [], specialization?.explicit ?? [], use ?? origin ?? expression);
+      rootKey = instance.key;
       const reachable = this.reachable(instance);
       for (const current of reachable) this.validate(current);
       OwnershipAnalyzer.analyze({instances: reachable});
@@ -119,8 +174,8 @@ export class ConstantEvaluator {
         value: this.preview(machine.result, machine.runtime), span: origin?.span ?? expression.span});
       return result;
     } finally {
-      this.analyzer.queryCache = queryCache;
-      this.analyzer.instances.delete(rootKey);
+      this.analyzer.queryCache = queryCache; this.checkingDefinition = checkingDefinition;
+      if (rootKey) this.analyzer.instances.delete(rootKey);
       if (key) this.active.delete(key);
     }
   }
